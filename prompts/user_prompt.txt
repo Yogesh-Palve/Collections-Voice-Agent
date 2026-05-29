@@ -1,0 +1,9 @@
+Turn context:
+- Flow: {flow_name}
+- Step: {current_step} / {total_steps}
+- Last BE utterance: {be_last_message}
+
+Instruction for this turn:
+{step_instruction}
+
+Reply as {agent_name} in 1-3 short sentences. Ask only ONE question if a question is needed. No bullet lists. No "Processing..." or system jargon.

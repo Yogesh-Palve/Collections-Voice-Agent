@@ -1,0 +1,33 @@
+# Environment and secrets
+.env
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Logs and runtime data
+logs/*.json
+logs/*.log
+!logs/.gitkeep
+
+# Audio test artifacts
+*.wav
+*.mp3
+tests/fixtures/output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

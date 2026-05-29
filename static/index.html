@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Collections Voice Agent</title>
+  <style>
+    :root { --bg: #0f1419; --card: #1a2332; --accent: #3b82f6; --text: #e7ecf3; --muted: #94a3b8; }
+    * { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: var(--card); border-radius: 12px; padding: 1rem; }
+    button { background: var(--accent); color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 8px; cursor: pointer; font-size: 0.95rem; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.danger { background: #dc2626; }
+    #waveform { height: 80px; background: #0b1020; border-radius: 8px; margin: 0.75rem 0; display: flex; align-items: center; justify-content: center; gap: 3px; padding: 0 8px; }
+    .bar { width: 4px; background: var(--accent); border-radius: 2px; height: 8px; transition: height 0.05s; }
+    #transcript { max-height: 320px; overflow-y: auto; font-size: 0.9rem; line-height: 1.5; }
+    .msg { margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 8px; }
+    .msg.user { background: #1e3a5f; }
+    .msg.assistant { background: #1a3d2e; }
+    .role { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; }
+    #metrics { font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; color: var(--muted); }
+    input, select { background: #0b1020; border: 1px solid #334155; color: var(--text); padding: 0.4rem 0.6rem; border-radius: 6px; margin-right: 0.5rem; }
+    .status { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.75rem; background: #334155; }
+    .status.live { background: #166534; }
+  </style>
+</head>
+<body>
+  <h1>Collections Voice Agent</h1>
+  <p class="sub">Web microphone → STT → LLM → TTS · Priya / Rahul</p>
+
+  <div class="grid">
+    <div class="card">
+      <label>BE ID <input id="beId" placeholder="BE-2041" /></label>
+      <label>Call type
+        <select id="callType">
+          <option value="general">General</option>
+          <option value="forward-flow">Forward Flow</option>
+          <option value="DPD">DPD</option>
+          <option value="bounce">Bounce</option>
+          <option value="HNI">HNI</option>
+          <option value="cross-sell">Cross-sell</option>
+        </select>
+      </label>
+      <p><span id="status" class="status">idle</span> Session: <code id="sessionId">—</code></p>
+      <div id="waveform"></div>
+      <button id="btnStart">Start Call</button>
+      <button id="btnTalk" disabled>Hold to Talk</button>
+      <button id="btnEnd" class="danger" disabled>End Call</button>
+      <audio id="player" controls style="width:100%; margin-top:0.75rem;"></audio>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Live transcript</h3>
+      <div id="transcript"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:1rem">
+    <h3 style="margin-top:0">Session summary</h3>
+    <pre id="metrics">Start a call to see metrics.</pre>
+  </div>
+
+  <script>
+    const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/audio`;
+    let ws, sessionId, audioCtx, processor, stream, mediaRecorder;
+    let analyser, animationId;
+    const waveform = document.getElementById('waveform');
+    for (let i = 0; i < 40; i++) {
+      const b = document.createElement('div');
+      b.className = 'bar';
+      waveform.appendChild(b);
+    }
+    const bars = waveform.querySelectorAll('.bar');
+
+    function setStatus(s, live) {
+      const el = document.getElementById('status');
+      el.textContent = s;
+      el.className = 'status' + (live ? ' live' : '');
+    }
+
+    function addTranscript(role, text) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + role;
+      div.innerHTML = `<div class="role">${role}</div>${text}`;
+      document.getElementById('transcript').appendChild(div);
+      div.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function playAudio(b64, mime) {
+      const player = document.getElementById('player');
+      player.src = `data:${mime || 'audio/mpeg'};base64,${b64}`;
+      player.play().catch(() => {});
+    }
+
+    function connectWs() {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(WS_URL);
+        ws.onopen = () => resolve();
+        ws.onerror = reject;
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'session') {
+            sessionId = msg.session_id;
+            document.getElementById('sessionId').textContent = sessionId;
+          }
+          if (msg.type === 'transcript') addTranscript(msg.role, msg.text);
+          if (msg.type === 'audio') playAudio(msg.data, msg.mime);
+          if (msg.type === 'metrics') {
+            document.getElementById('metrics').textContent = JSON.stringify(msg.data, null, 2);
+          }
+          if (msg.type === 'error') alert(msg.message);
+        };
+      });
+    }
+
+    async function startMic() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 }, video: false });
+      audioCtx = new AudioContext({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      source.connect(analyser);
+      const bufferSize = 4096;
+      processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      processor.onaudioprocess = (e) => {
+        if (!window._recording) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const pcm = floatTo16BitPCM(input);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'audio', data: arrayBufferToBase64(pcm.buffer) }));
+        }
+      };
+      function draw() {
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        bars.forEach((bar, i) => {
+          const v = data[i % data.length] || 0;
+          bar.style.height = Math.max(4, v / 3) + 'px';
+        });
+        animationId = requestAnimationFrame(draw);
+      }
+      draw();
+    }
+
+    function floatTo16BitPCM(float32Array) {
+      const out = new Int16Array(float32Array.length);
+      for (let i = 0; i < float32Array.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32Array[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
+    document.getElementById('btnStart').onclick = async () => {
+      document.getElementById('transcript').innerHTML = '';
+      await connectWs();
+      await startMic();
+      ws.send(JSON.stringify({
+        type: 'start',
+        be_id: document.getElementById('beId').value,
+        call_type: document.getElementById('callType').value,
+      }));
+      setStatus('connected', true);
+      document.getElementById('btnTalk').disabled = false;
+      document.getElementById('btnEnd').disabled = false;
+    };
+
+    const btnTalk = document.getElementById('btnTalk');
+    btnTalk.onmousedown = () => { window._recording = true; btnTalk.textContent = 'Recording…'; };
+    btnTalk.onmouseup = btnTalk.onmouseleave = () => {
+      if (!window._recording) return;
+      window._recording = false;
+      btnTalk.textContent = 'Hold to Talk';
+      if (ws) ws.send(JSON.stringify({ type: 'end_utterance' }));
+    };
+
+    document.getElementById('btnEnd').onclick = () => {
+      if (ws) ws.send(JSON.stringify({ type: 'end_call' }));
+      if (processor) processor.disconnect();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      if (animationId) cancelAnimationFrame(animationId);
+      setStatus('ended');
+      document.getElementById('btnTalk').disabled = true;
+    };
+  </script>
+</body>
+</html>

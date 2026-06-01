@@ -118,22 +118,38 @@
     }
 
     async function startMic() {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 }, video: false });
-      audioCtx = new AudioContext({ sampleRate: 16000 });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        video: false,
+      });
+      audioCtx = new AudioContext();
+      const captureRate = audioCtx.sampleRate;
+      window._captureSampleRate = captureRate;
+
       const source = audioCtx.createMediaStreamSource(stream);
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 64;
       source.connect(analyser);
+
       const bufferSize = 4096;
       processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
       source.connect(processor);
-      processor.connect(audioCtx.destination);
+      // Silent output — avoids mic echo; keeps processor alive
+      const silent = audioCtx.createGain();
+      silent.gain.value = 0;
+      processor.connect(silent);
+      silent.connect(audioCtx.destination);
+
       processor.onaudioprocess = (e) => {
         if (!window._recording) return;
         const input = e.inputBuffer.getChannelData(0);
         const pcm = floatTo16BitPCM(input);
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'audio', data: arrayBufferToBase64(pcm.buffer) }));
+          ws.send(JSON.stringify({
+            type: 'audio',
+            data: arrayBufferToBase64(pcm.buffer),
+            sample_rate: captureRate,
+          }));
         }
       };
       function draw() {
@@ -172,6 +188,7 @@
         type: 'start',
         be_id: document.getElementById('beId').value,
         call_type: document.getElementById('callType').value,
+        sample_rate: window._captureSampleRate || 48000,
       }));
       setStatus('connected', true);
       document.getElementById('btnTalk').disabled = false;

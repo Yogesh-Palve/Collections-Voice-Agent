@@ -96,6 +96,8 @@ async def websocket_audio(websocket: WebSocket) -> None:
                         call_type=msg.get("call_type", "general"),
                         be_id=msg.get("be_id", ""),
                     )
+                    if msg.get("sample_rate"):
+                        pipeline.set_input_sample_rate(int(msg["sample_rate"]))
                     register_pipeline(pipeline)
                 text, audio = pipeline.opening_audio()
                 await send_json({"type": "transcript", "role": "assistant", "text": text})
@@ -111,7 +113,9 @@ async def websocket_audio(websocket: WebSocket) -> None:
 
             elif mtype == "audio" and pipeline:
                 chunk = base64.b64decode(msg.get("data", ""))
-                pipeline.ingest_audio(chunk)
+                if msg.get("sample_rate"):
+                    pipeline.set_input_sample_rate(int(msg["sample_rate"]))
+                pipeline.ingest_audio(chunk, buffer_always=True)
 
             elif mtype == "end_utterance" and pipeline:
                 loop = asyncio.get_event_loop()

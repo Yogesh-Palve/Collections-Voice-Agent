@@ -128,6 +128,37 @@ class SarvamTTS(TTSProvider):
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
 
+    def _build_request_payload(self, text: str) -> dict:
+        """
+        Build Sarvam TTS JSON body.
+
+        Bulbul V3 rejects pitch and loudness; V1 accepts them.
+        """
+        model = getattr(self.settings, "sarvam_model", "bulbul:v3") or "bulbul:v3"
+        payload: dict = {
+            "inputs": [text],
+            "target_language_code": self.settings.sarvam_language,
+            "speaker": self.settings.sarvam_speaker,
+            "model": model,
+            "enable_preprocessing": True,
+        }
+        if model.startswith("bulbul:v3"):
+            # V3: pace/sample_rate only; no pitch or loudness per Sarvam API
+            payload["pace"] = getattr(self.settings, "sarvam_pace", 1.0)
+            payload["speech_sample_rate"] = getattr(
+                self.settings, "sarvam_sample_rate", 22050
+            )
+        else:
+            payload.update(
+                {
+                    "pitch": 0,
+                    "pace": 1.0,
+                    "loudness": 1.0,
+                    "speech_sample_rate": 22050,
+                }
+            )
+        return payload
+
     def synthesize(self, text: str) -> bytes:
         """Synthesize via Sarvam bulbul TTS API."""
         if not text.strip() or not self.settings.sarvam_api_key:
@@ -140,17 +171,7 @@ class SarvamTTS(TTSProvider):
                         "api-subscription-key": self.settings.sarvam_api_key,
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "inputs": [text],
-                        "target_language_code": self.settings.sarvam_language,
-                        "speaker": self.settings.sarvam_speaker,
-                        "pitch": 0,
-                        "pace": 1.0,
-                        "loudness": 1.0,
-                        "speech_sample_rate": 22050,
-                        "enable_preprocessing": True,
-                        "model": "bulbul:v1",
-                    },
+                    json=self._build_request_payload(text),
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -160,6 +181,13 @@ class SarvamTTS(TTSProvider):
                 import base64
 
                 return base64.b64decode(audios[0])
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Sarvam TTS failed: %s; response=%s",
+                exc,
+                exc.response.text if exc.response is not None else None,
+            )
+            return b""
         except Exception as exc:
             logger.error("Sarvam TTS failed: %s", exc)
             return b""

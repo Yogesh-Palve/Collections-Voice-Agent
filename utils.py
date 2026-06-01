@@ -5,6 +5,7 @@ Audio processing, VAD, metrics persistence, Hindi number normalization.
 from __future__ import annotations
 
 import json
+import io
 import re
 import struct
 from datetime import datetime, timezone
@@ -18,6 +19,22 @@ from logging_utils import setup_error_logger
 
 logger = setup_error_logger(__name__)
 
+# webrtcvad imports pkg_resources at load time; ensure setuptools is importable first
+try:
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore",
+        message="pkg_resources is deprecated",
+        category=UserWarning,
+        module=r"webrtcvad",
+    )
+    import setuptools  # noqa: F401
+except ImportError:
+    pass
+
+_webrtc_vad_warned = False
+
 # Hindi / Hinglish number words → integer
 _HINDI_NUMBERS = {
     "zero": 0, "ek": 1, "one": 1, "do": 2, "two": 2, "teen": 3, "three": 3,
@@ -29,39 +46,90 @@ _HINDI_NUMBERS = {
 }
 
 
+def _energy_voice_activity(
+    audio_chunk: bytes,
+    *,
+    threshold: float = 400.0,
+) -> bool:
+    """
+    RMS energy fallback when WebRTC VAD is unavailable.
+
+    Args:
+        audio_chunk: PCM16 mono bytes.
+        threshold: RMS above this counts as speech.
+    """
+    samples = np.frombuffer(audio_chunk, dtype=np.int16)
+    if samples.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+    return rms >= threshold
+
+
+def _webrtc_voice_activity(
+    audio_chunk: bytes,
+    *,
+    sample_rate: int,
+    frame_ms: int,
+    aggressiveness: int,
+) -> bool:
+    """WebRTC VAD over fixed frames."""
+    import webrtcvad
+
+    vad = webrtcvad.Vad(aggressiveness)
+    frame_len = int(sample_rate * frame_ms / 1000) * 2
+    for i in range(0, len(audio_chunk) - frame_len + 1, frame_len):
+        frame = audio_chunk[i : i + frame_len]
+        if len(frame) < frame_len:
+            break
+        if vad.is_speech(frame, sample_rate):
+            return True
+    return False
+
+
 def detect_voice_activity(
     audio_chunk: bytes,
     *,
     sample_rate: int = 16000,
     frame_ms: int = 30,
     aggressiveness: int = 2,
+    energy_threshold: Optional[float] = None,
 ) -> bool:
     """
     Return True if any frame in the buffer contains speech (WebRTC VAD).
+
+    Falls back to RMS energy detection if webrtcvad cannot load (e.g. missing
+    pkg_resources / setuptools on Python 3.12+).
 
     Args:
         audio_chunk: PCM16 mono bytes.
         sample_rate: Must be 8000, 16000, 32000, or 48000.
         frame_ms: 10, 20, or 30.
         aggressiveness: 0-3.
+        energy_threshold: RMS threshold for fallback VAD.
     """
+    global _webrtc_vad_warned
     if not audio_chunk:
         return False
-    try:
-        import webrtcvad
 
-        vad = webrtcvad.Vad(aggressiveness)
-        frame_len = int(sample_rate * frame_ms / 1000) * 2
-        for i in range(0, len(audio_chunk) - frame_len + 1, frame_len):
-            frame = audio_chunk[i : i + frame_len]
-            if len(frame) < frame_len:
-                break
-            if vad.is_speech(frame, sample_rate):
-                return True
-        return False
+    settings = get_settings()
+    threshold = energy_threshold if energy_threshold is not None else settings.vad_energy_threshold
+
+    try:
+        return _webrtc_voice_activity(
+            audio_chunk,
+            sample_rate=sample_rate,
+            frame_ms=frame_ms,
+            aggressiveness=aggressiveness,
+        )
     except Exception as exc:
-        logger.error("VAD failed: %s", exc)
-        return False
+        if not _webrtc_vad_warned:
+            logger.warning(
+                "WebRTC VAD unavailable (%s); using energy-based VAD. "
+                "Install setuptools: pip install setuptools",
+                exc,
+            )
+            _webrtc_vad_warned = True
+        return _energy_voice_activity(audio_chunk, threshold=threshold)
 
 
 def normalize_audio(audio_chunk: bytes, target_db: float = -20.0) -> bytes:
@@ -225,3 +293,53 @@ def resample_pcm16(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
 
     pcm, _ = audioop.ratecv(pcm, 2, 1, from_rate, to_rate, None)
     return pcm
+
+
+def prepare_pcm_for_stt(
+    pcm: bytes,
+    *,
+    target_rate: int = 16000,
+    source_rate: Optional[int] = None,
+    min_ms: int = 300,
+) -> tuple[Optional[bytes], int]:
+    """
+    Normalize PCM for STT APIs: even length, resample, minimum duration.
+
+    Returns:
+        (pcm_bytes, sample_rate) or (None, 0) if audio is too short/invalid.
+    """
+    if not pcm:
+        return None, 0
+
+    if len(pcm) % 2 != 0:
+        pcm = pcm[:-1]
+    if not pcm:
+        return None, 0
+
+    src_rate = source_rate or target_rate
+    if src_rate != target_rate:
+        pcm = resample_pcm16(pcm, src_rate, target_rate)
+
+    duration_ms = pcm_duration_seconds(pcm, target_rate) * 1000
+    if duration_ms < min_ms:
+        logger.warning(
+            "STT audio too short: %.0fms (min %dms); skipping transcription",
+            duration_ms,
+            min_ms,
+        )
+        return None, 0
+
+    return pcm, target_rate
+
+
+def pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap raw PCM16 mono in a WAV container for STT APIs."""
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()

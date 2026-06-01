@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from utils import (
+    _energy_voice_activity,
     detect_voice_activity,
     estimate_costs,
     hindi_number_normalize,
@@ -47,6 +48,16 @@ def test_normalize_audio():
 def test_vad_on_silence():
     """Silence should not trigger VAD."""
     assert detect_voice_activity(_silence_pcm(100)) is False
+
+
+def test_energy_vad_on_tone():
+    """Energy fallback detects loud tone."""
+    assert _energy_voice_activity(_tone_pcm(100), threshold=1000) is True
+
+
+def test_energy_vad_on_silence():
+    """Energy fallback ignores silence."""
+    assert _energy_voice_activity(_silence_pcm(100), threshold=500) is False
 
 
 def test_hindi_number_normalize():

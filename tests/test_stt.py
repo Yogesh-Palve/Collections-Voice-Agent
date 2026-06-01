@@ -38,7 +38,8 @@ def test_elevenlabs_stt_mock(mock_client_cls):
     settings = get_settings()
     settings.elevenlabs_api_key = "test-key"
     stt = ElevenLabsSTT(settings)
-    text = stt.transcribe(_pcm_to_wav(b"\x00\x00" * 1600, 16000))
+    pcm = b"\x00\x00" * 8000  # 0.5s at 16kHz
+    text = stt.transcribe(pcm, sample_rate=16000)
     assert text == "namaste"
 
 

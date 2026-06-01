@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     deepgram_model: str = Field(default="nova-2", alias="DEEPGRAM_MODEL")
     deepgram_language: str = Field(default="hi", alias="DEEPGRAM_LANGUAGE")
     elevenlabs_api_key: str = Field(default="", alias="ELEVENLABS_API_KEY")
+    elevenlabs_stt_fallback: bool = Field(default=False, alias="ELEVENLABS_STT_FALLBACK")
     cartesia_api_key: str = Field(default="", alias="CARTESIA_API_KEY")
     hume_api_key: str = Field(default="", alias="HUME_API_KEY")
 
@@ -47,8 +48,11 @@ class Settings(BaseSettings):
         default="eleven_flash_v2_5", alias="ELEVENLABS_TTS_MODEL"
     )
     sarvam_api_key: str = Field(default="", alias="SARVAM_API_KEY")
-    sarvam_speaker: str = Field(default="meera", alias="SARVAM_SPEAKER")
+    sarvam_speaker: str = Field(default="shubh", alias="SARVAM_SPEAKER")
     sarvam_language: str = Field(default="hi-IN", alias="SARVAM_LANGUAGE")
+    sarvam_model: str = Field(default="bulbul:v3", alias="SARVAM_MODEL")
+    sarvam_pace: float = Field(default=1.0, alias="SARVAM_PACE")
+    sarvam_sample_rate: int = Field(default=22050, alias="SARVAM_SAMPLE_RATE")
 
     # LLM
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
@@ -76,6 +80,8 @@ class Settings(BaseSettings):
     # Audio / VAD
     vad_aggressiveness: int = Field(default=2, alias="VAD_AGGRESSIVENESS")
     vad_frame_ms: int = Field(default=30, alias="VAD_FRAME_MS")
+    vad_energy_threshold: float = Field(default=400.0, alias="VAD_ENERGY_THRESHOLD")
+    min_stt_audio_ms: int = Field(default=300, alias="MIN_STT_AUDIO_MS")
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")
 
     # Cost estimates (USD)

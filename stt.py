@@ -4,7 +4,6 @@ Speech-to-text abstraction — Deepgram, ElevenLabs, Cartesia, Hume (switchable 
 
 from __future__ import annotations
 
-import io
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -12,6 +11,7 @@ import httpx
 
 from config import Settings, get_settings
 from logging_utils import setup_error_logger
+from utils import pcm_to_wav, prepare_pcm_for_stt
 
 logger = setup_error_logger(__name__)
 
@@ -39,7 +39,9 @@ class STTProvider(ABC):
         Returns:
             (transcript, seconds)
         """
-        seconds = len(audio_chunk) / (2 * sample_rate) if audio_chunk else 0.0
+        from utils import pcm_duration_seconds
+
+        seconds = pcm_duration_seconds(audio_chunk, sample_rate) if audio_chunk else 0.0
         return self.transcribe(audio_chunk, sample_rate=sample_rate), seconds
 
 
@@ -61,13 +63,24 @@ class DeepgramSTT(STTProvider):
                 logger.error("Deepgram init failed: %s", exc)
 
     def transcribe(self, audio_chunk: bytes, *, sample_rate: int = 16000) -> str:
-        """Transcribe via Deepgram prerecorded API."""
+        """Transcribe via Deepgram prerecorded API (WAV container)."""
         if not self._client or not audio_chunk:
             return ""
+
+        prepared, rate = prepare_pcm_for_stt(
+            audio_chunk,
+            target_rate=self.settings.sample_rate,
+            source_rate=sample_rate,
+            min_ms=self.settings.min_stt_audio_ms,
+        )
+        if not prepared:
+            return ""
+
+        wav = pcm_to_wav(prepared, rate)
         try:
             payload = {
-                "buffer": audio_chunk,
-                "mimetype": "audio/raw",
+                "buffer": wav,
+                "mimetype": "audio/wav",
             }
             options = {
                 "model": self.settings.deepgram_model,
@@ -88,7 +101,7 @@ class DeepgramSTT(STTProvider):
 
 
 class ElevenLabsSTT(STTProvider):
-    """ElevenLabs speech-to-text fallback."""
+    """ElevenLabs speech-to-text fallback (requires STT-enabled API key)."""
 
     name = "elevenlabs"
 
@@ -100,8 +113,18 @@ class ElevenLabsSTT(STTProvider):
         """Transcribe via ElevenLabs STT REST API."""
         if not self.settings.elevenlabs_api_key or not audio_chunk:
             return ""
+
+        prepared, rate = prepare_pcm_for_stt(
+            audio_chunk,
+            target_rate=self.settings.sample_rate,
+            source_rate=sample_rate,
+            min_ms=self.settings.min_stt_audio_ms,
+        )
+        if not prepared:
+            return ""
+
+        wav = pcm_to_wav(prepared, rate)
         try:
-            wav = _pcm_to_wav(audio_chunk, sample_rate)
             with httpx.Client(timeout=30.0) as client:
                 resp = client.post(
                     "https://api.elevenlabs.io/v1/speech-to-text",
@@ -112,6 +135,16 @@ class ElevenLabsSTT(STTProvider):
                 resp.raise_for_status()
                 data = resp.json()
                 return (data.get("text") or data.get("transcript") or "").strip()
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 401:
+                logger.error(
+                    "ElevenLabs STT unauthorized (401). "
+                    "Your key may be TTS-only — set ELEVENLABS_STT_FALLBACK=false "
+                    "or use a key with Speech-to-Text access."
+                )
+            else:
+                logger.error("ElevenLabs STT failed: %s", exc)
+            return ""
         except Exception as exc:
             logger.error("ElevenLabs STT failed: %s", exc)
             return ""
@@ -129,6 +162,14 @@ class CartesiaSTT(STTProvider):
         """Transcribe using Cartesia API if configured."""
         if not self.settings.cartesia_api_key or not audio_chunk:
             return ""
+        prepared, rate = prepare_pcm_for_stt(
+            audio_chunk,
+            target_rate=self.settings.sample_rate,
+            source_rate=sample_rate,
+            min_ms=self.settings.min_stt_audio_ms,
+        )
+        if not prepared:
+            return ""
         try:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.post(
@@ -137,7 +178,13 @@ class CartesiaSTT(STTProvider):
                         "X-API-Key": self.settings.cartesia_api_key,
                         "Cartesia-Version": "2024-06-10",
                     },
-                    files={"file": ("audio.wav", _pcm_to_wav(audio_chunk, sample_rate), "audio/wav")},
+                    files={
+                        "file": (
+                            "audio.wav",
+                            pcm_to_wav(prepared, rate),
+                            "audio/wav",
+                        )
+                    },
                 )
                 if resp.status_code == 404:
                     logger.error("Cartesia STT endpoint unavailable")
@@ -161,14 +208,27 @@ class HumeSTT(STTProvider):
         """Transcribe via Hume if API key present."""
         if not self.settings.hume_api_key or not audio_chunk:
             return ""
+        prepared, rate = prepare_pcm_for_stt(
+            audio_chunk,
+            target_rate=self.settings.sample_rate,
+            source_rate=sample_rate,
+            min_ms=self.settings.min_stt_audio_ms,
+        )
+        if not prepared:
+            return ""
         try:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.post(
                     "https://api.hume.ai/v0/batch/jobs",
                     headers={"X-Hume-Api-Key": self.settings.hume_api_key},
-                    files={"file": ("audio.wav", _pcm_to_wav(audio_chunk, sample_rate), "audio/wav")},
+                    files={
+                        "file": (
+                            "audio.wav",
+                            pcm_to_wav(prepared, rate),
+                            "audio/wav",
+                        )
+                    },
                 )
-                # Batch-only on Hume; return empty for realtime chunk path
                 if resp.status_code >= 400:
                     return ""
                 return (resp.json().get("text") or "").strip()
@@ -178,18 +238,18 @@ class HumeSTT(STTProvider):
 
 
 class FallbackSTT(STTProvider):
-    """Primary with automatic fallback chain."""
+    """Primary with optional ElevenLabs fallback."""
 
     name = "fallback"
 
-    def __init__(self, primary: STTProvider, fallback: STTProvider) -> None:
+    def __init__(self, primary: STTProvider, fallback: Optional[STTProvider]) -> None:
         self.primary = primary
         self.fallback = fallback
 
     def transcribe(self, audio_chunk: bytes, *, sample_rate: int = 16000) -> str:
-        """Try primary, then fallback."""
+        """Try primary, then optional fallback."""
         text = self.primary.transcribe(audio_chunk, sample_rate=sample_rate)
-        if text:
+        if text or not self.fallback:
             return text
         return self.fallback.transcribe(audio_chunk, sample_rate=sample_rate)
 
@@ -198,7 +258,7 @@ def get_stt_provider(name: Optional[str] = None, settings: Optional[Settings] = 
     """
     Factory for STT provider controlled by STT_PROVIDER env var.
 
-    deepgram uses ElevenLabs as fallback when primary returns empty.
+    Deepgram optionally falls back to ElevenLabs STT when ELEVENLABS_STT_FALLBACK=true.
     """
     settings = settings or get_settings()
     key = (name or settings.stt_provider).lower().strip()
@@ -210,20 +270,15 @@ def get_stt_provider(name: Optional[str] = None, settings: Optional[Settings] = 
         "hume": HumeSTT(settings),
     }
     primary = providers.get(key, DeepgramSTT(settings))
+
     if key == "deepgram":
-        return FallbackSTT(primary, ElevenLabsSTT(settings))
+        fallback = None
+        if settings.elevenlabs_stt_fallback and settings.elevenlabs_api_key:
+            fallback = ElevenLabsSTT(settings)
+        return FallbackSTT(primary, fallback)
+
     return primary
 
 
-def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    """Wrap raw PCM16 mono in a minimal WAV container."""
-    import struct
-    import wave
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
+# Backwards-compatible alias used in tests
+_pcm_to_wav = pcm_to_wav

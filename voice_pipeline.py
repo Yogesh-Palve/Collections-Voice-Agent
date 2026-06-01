@@ -23,6 +23,7 @@ from utils import (
     hindi_number_normalize,
     normalize_audio,
     pcm_duration_seconds,
+    prepare_pcm_for_stt,
     save_session_metrics,
 )
 
@@ -61,7 +62,8 @@ class VoicePipeline:
         self._audio_buffer = bytearray()
         self._agent_speaking = False
         self._retry_count = 0
-        self.max_retries = 3
+        self.max_retries = 1
+        self.input_sample_rate = self.settings.sample_rate
 
         now = datetime.now(timezone.utc)
         self.metrics: dict[str, Any] = {
@@ -87,24 +89,36 @@ class VoicePipeline:
         }
         self.conversation: list[dict[str, str]] = []
 
-    def ingest_audio(self, chunk: bytes) -> bool:
+    def set_input_sample_rate(self, sample_rate: int) -> None:
+        """Set browser/device capture rate for resampling before STT."""
+        if sample_rate and sample_rate > 0:
+            self.input_sample_rate = sample_rate
+
+    def ingest_audio(self, chunk: bytes, *, buffer_always: bool = False) -> bool:
         """
-        Buffer audio after VAD check.
+        Buffer audio after optional VAD check.
+
+        Args:
+            chunk: PCM16 mono bytes.
+            buffer_always: If True, buffer all chunks (web hold-to-talk).
 
         Returns:
-            True if speech detected in chunk.
+            True if chunk was buffered.
         """
         if self._agent_speaking and detect_voice_activity(
             chunk,
-            sample_rate=self.settings.sample_rate,
+            sample_rate=self.input_sample_rate,
             frame_ms=self.settings.vad_frame_ms,
             aggressiveness=self.settings.vad_aggressiveness,
         ):
             self.handle_interruption()
         normalized = normalize_audio(chunk)
+        if buffer_always:
+            self._audio_buffer.extend(normalized)
+            return True
         if detect_voice_activity(
             normalized,
-            sample_rate=self.settings.sample_rate,
+            sample_rate=self.input_sample_rate,
             frame_ms=self.settings.vad_frame_ms,
             aggressiveness=self.settings.vad_aggressiveness,
         ):
@@ -137,8 +151,17 @@ class VoicePipeline:
         if not pcm:
             return "", "", b""
 
+        prepared, rate = prepare_pcm_for_stt(
+            pcm,
+            target_rate=self.settings.sample_rate,
+            source_rate=self.input_sample_rate,
+            min_ms=self.settings.min_stt_audio_ms,
+        )
+        if not prepared:
+            return "", "", b""
+
         start = time.perf_counter()
-        user_text, stt_seconds = self._transcribe_with_retry(pcm)
+        user_text, stt_seconds = self._transcribe_with_retry(prepared, rate)
         user_text = hindi_number_normalize(user_text)
 
         if user_text:
@@ -164,21 +187,19 @@ class VoicePipeline:
 
         return user_text, assistant_text, assistant_audio
 
-    def _transcribe_with_retry(self, pcm: bytes) -> tuple[str, float]:
-        """STT with retry on failure."""
-        seconds = pcm_duration_seconds(pcm, self.settings.sample_rate)
-        for attempt in range(self.max_retries):
-            try:
-                text, dur = self.stt.transcribe_with_duration(
-                    pcm, sample_rate=self.settings.sample_rate
-                )
-                if text:
-                    self.metrics["total_stt_seconds"] += dur or seconds
-                    self._retry_count = 0
-                    return text, dur or seconds
-            except Exception as exc:
-                logger.error("STT attempt %d failed: %s", attempt + 1, exc)
-            time.sleep(0.1 * (attempt + 1))
+    def _transcribe_with_retry(self, pcm: bytes, sample_rate: int) -> tuple[str, float]:
+        """STT with at most one retry on empty result."""
+        seconds = pcm_duration_seconds(pcm, sample_rate)
+        for attempt in range(self.max_retries + 1):
+            text, dur = self.stt.transcribe_with_duration(
+                pcm, sample_rate=sample_rate
+            )
+            if text:
+                self.metrics["total_stt_seconds"] += dur or seconds
+                return text, dur or seconds
+            if attempt >= self.max_retries:
+                break
+            time.sleep(0.05)
         self.metrics["total_stt_seconds"] += seconds
         return "", seconds
 
